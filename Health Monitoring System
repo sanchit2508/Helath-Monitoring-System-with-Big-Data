@@ -1,0 +1,141 @@
+from kafka import KafkaProducer
+import json
+import random
+import time
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+from pyspark.sql.types import StructType, StructField, IntegerType, StringType, FloatType
+from pyspark.streaming import StreamingContext
+from pyspark.streaming.kafka import KafkaUtils
+from sklearn.ensemble import IsolationForest
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+
+# Kafka Producer Setup - Simulate Real-time Patient Data
+producer = KafkaProducer(bootstrap_servers='localhost:9092', value_serializer=lambda x: json.dumps(x).encode('utf-8'))
+
+def generate_patient_data():
+    data = {
+        'patient_id': random.randint(1000, 9999),
+        'heart_rate': random.randint(60, 100),
+        'blood_pressure': f"{random.randint(100, 140)}/{random.randint(60, 90)}",
+        'oxygen_level': random.uniform(95, 100)
+    }
+    return data
+
+while True:
+    patient_data = generate_patient_data()
+    producer.send('patient_vitals', value=patient_data)  # Sending data to Kafka topic 'patient_vitals'
+    time.sleep(1)  # Simulate data every second
+
+
+# PySpark Consumer - Process Real-time Data from Kafka
+spark = SparkSession.builder.appName("HealthMonitoring").getOrCreate()
+ssc = StreamingContext(spark.sparkContext, 1)  # Batch interval of 1 second
+
+# Define the schema for the data
+schema = StructType([
+    StructField("patient_id", IntegerType(), True),
+    StructField("heart_rate", IntegerType(), True),
+    StructField("blood_pressure", StringType(), True),
+    StructField("oxygen_level", FloatType(), True)
+])
+
+# Kafka stream
+kafka_stream = KafkaUtils.createStream(ssc, 'localhost:2181', 'health_monitoring_group', {'patient_vitals': 1})
+
+# Parse the Kafka messages
+def parse_message(message):
+    record = json.loads(message[1])
+    return (record['patient_id'], record['heart_rate'], record['blood_pressure'], record['oxygen_level'])
+
+# Processing stream
+lines = kafka_stream.map(lambda x: parse_message(x))
+df = spark.createDataFrame(lines, schema)
+
+# Show real-time data
+df.show()
+
+# Start streaming
+ssc.start()
+ssc.awaitTermination()
+
+
+# Anomaly Detection with Isolation Forest
+data = {
+    'heart_rate': [75, 90, 120, 70, 110, 150, 80, 85],
+    'oxygen_level': [98, 95, 92, 99, 91, 88, 94, 96]
+}
+
+# Convert to DataFrame
+df = pd.DataFrame(data)
+
+# Anomaly detection model
+model = IsolationForest(contamination=0.1)  # 10% of data considered as anomalies
+df['anomaly'] = model.fit_predict(df[['heart_rate', 'oxygen_level']])
+
+# Mark anomalies (1 for normal, -1 for anomaly)
+df['anomaly'] = df['anomaly'].apply(lambda x: 'Anomaly' if x == -1 else 'Normal')
+
+print(df)
+
+
+# Predictive Analysis with LSTM
+# Example patient heart rate data over time (e.g., last 30 readings)
+data = np.array([75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150, 155, 160, 165, 170])
+data = data.reshape(-1, 1)
+
+# Normalize data
+scaler = MinMaxScaler(feature_range=(0, 1))
+data_scaled = scaler.fit_transform(data)
+
+# Create sequences for LSTM (using past 5 data points to predict next)
+X = []
+y = []
+
+for i in range(5, len(data)):
+    X.append(data_scaled[i-5:i, 0])
+    y.append(data_scaled[i, 0])
+
+X = np.array(X)
+y = np.array(y)
+
+# Reshape X for LSTM (samples, time steps, features)
+X = X.reshape(X.shape[0], X.shape[1], 1)
+
+# Build LSTM model
+model = Sequential()
+model.add(LSTM(units=50, return_sequences=True, input_shape=(X.shape[1], 1)))
+model.add(LSTM(units=50))
+model.add(Dense(units=1))  # Output: next heart rate
+
+model.compile(optimizer='adam', loss='mean_squared_error')
+
+# Train the model
+model.fit(X, y, epochs=20, batch_size=32)
+
+# Predict next heart rate
+predicted_heart_rate = model.predict(X[-1].reshape(1, 5, 1))
+predicted_heart_rate = scaler.inverse_transform(predicted_heart_rate)
+
+print("Predicted next heart rate:", predicted_heart_rate)
+
+
+# Visualization of Patient Data
+time = np.arange(0, len(data), 1)
+heart_rate = data.flatten()
+
+plt.plot(time, heart_rate, label='Heart Rate')
+plt.xlabel('Time')
+plt.ylabel('Heart Rate (bpm)')
+plt.title('Patient Heart Rate Over Time')
+plt.show()
+
+
+# Storing Data in HDFS
+df.write.format('parquet').save('hdfs://localhost:9000/user/health_data/patient_vitals')
